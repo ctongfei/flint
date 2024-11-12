@@ -201,7 +201,3 @@ def derive_arrow_marshaller(cls: type) -> ArrowMarshaller:
     elif get_origin(cls) is not None and issubclass(get_origin(cls), Mapping):
         return MapArrowMarshaller(derive_arrow_marshaller(get_args(cls)[0]), derive_arrow_marshaller(get_args(cls)[1]))
     raise NotImplementedError(f"Cannot derive ArrowMarshaller for {cls}")
-
-
-m = derive_arrow_marshaller(list[int])
-m.to_arrow([1, 2, 3])
