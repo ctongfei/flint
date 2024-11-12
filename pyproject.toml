@@ -1,0 +1,19 @@
+[project]
+name = "flint"
+version = "0.1.0"
+description = "Datatype marshalling for Arrow and Spark"
+authors = ["Tongfei Chen <tongfei@pm.me>"]
+readme = "README.md"
+repository = "https://github.com/ctongfei/flint"
+packages = [{ include = "flint", from = "src" }]
+requires-python = ">= 3.10"
+dependencies = [
+    "pyarrow>=18.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.118.7",
+    "pip>=24.3.1",
+    "pytest>=8.3.3",
+]
