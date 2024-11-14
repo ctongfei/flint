@@ -1,12 +1,13 @@
 from dataclasses import is_dataclass, Field
 from abc import abstractmethod, ABC
-from collections.abc import Sequence, Mapping
+from collections.abc import Iterator, Sequence, Mapping
 
-from typing import TypeVar, Generic, get_origin, get_args, Any
+from typing import TypeVar, Generic, get_origin, get_args, Any, Callable, Optional
 import pyarrow as pa
 
 
 T = TypeVar('T')
+U = TypeVar('U')
 K = TypeVar('K')
 V = TypeVar('V')
 AS = TypeVar('AS', bound=pa.Scalar)
@@ -34,6 +35,26 @@ class ArrowMarshaller(Generic[T, AS, AA], ABC):
     @abstractmethod
     def from_arrow_array(self, arrow: AA) -> Sequence[T]:
         raise NotImplementedError
+
+
+class CustomArrowMarshaller(ArrowMarshaller[T, AS, AA]):
+    def __init__(self, base: ArrowMarshaller[U, AS, AA], encoder: Callable[[T], U], decoder: Callable[[U], T]):
+        super().__init__(base.py_type, base.arrow_dtype)
+        self.base = base
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def to_arrow(self, py: T) -> AS:
+        return self.base.to_arrow(self.encoder(py))
+
+    def from_arrow(self, arrow: AS) -> T:
+        return self.decoder(self.base.from_arrow(arrow))
+
+    def to_arrow_array(self, py: Sequence[T]) -> AA:
+        return self.base.to_arrow_array([self.encoder(x) for x in py])
+
+    def from_arrow_array(self, arrow: AA) -> Sequence[T]:
+        return [self.decoder(x) for x in self.base.from_arrow_array(arrow)]
 
 
 class BasicTypeArrowMarshaller(ArrowMarshaller[T, AS, AA]):
@@ -176,8 +197,13 @@ class StructArrowMarshaller(ArrowMarshaller[T, pa.StructScalar, pa.StructArray])
 
 
 def derive_arrow_marshaller_for_field(f: Field) -> ArrowMarshaller:
-    if f.metadata is not None and f.metadata.get('arrow_marshaller') is not None:
-        return f.metadata['arrow_marshaller']
+    if f.metadata is not None:
+        if f.metadata.get('arrow_marshaller') is not None:
+            return f.metadata['arrow_marshaller']
+        elif f.metadata.get('arrow_custom_codec') is not None:
+            cc = f.metadata['arrow_custom_codec']
+            m = derive_arrow_marshaller(cc['type'])
+            return CustomArrowMarshaller(m, cc['encoder'], cc['decoder'])
     return derive_arrow_marshaller(f.type)
 
 
@@ -201,3 +227,53 @@ def derive_arrow_marshaller(cls: type) -> ArrowMarshaller:
     elif get_origin(cls) is not None and issubclass(get_origin(cls), Mapping):
         return MapArrowMarshaller(derive_arrow_marshaller(get_args(cls)[0]), derive_arrow_marshaller(get_args(cls)[1]))
     raise NotImplementedError(f"Cannot derive ArrowMarshaller for {cls}")
+
+
+def read_parquet(f: str, cls: type[T]) -> Iterator[T]:
+    import pyarrow.parquet as pq
+    marshaller = derive_arrow_marshaller(cls)
+    schema = pa.schema(marshaller.arrow_dtype)
+    table = pq.read_table(f)
+    assert table.schema == schema
+    reader: pa.RecordBatchReader = table.to_reader()
+    for batch in reader:
+        assert isinstance(batch, pa.RecordBatch)
+        batch_array = batch.to_struct_array()
+        yield from marshaller.from_arrow_array(batch_array)
+
+
+class DataClassArrowMixin:
+
+    def __init_subclass__(cls: type[T], **kwargs):
+        super().__init_subclass__(**kwargs)
+        cls.arrow_marshaller: Optional[StructArrowMarshaller[T]] = None
+
+    @classmethod
+    def from_arrow(cls, arrow: pa.StructScalar) -> T:
+        if cls.arrow_marshaller is None:
+            cls.arrow_marshaller = derive_arrow_marshaller(cls)
+        return cls.arrow_marshaller.from_arrow(arrow)
+
+    @classmethod
+    def from_arrow_array(cls, arrow: pa.StructArray) -> Sequence[T]:
+        if cls.arrow_marshaller is None:
+            cls.arrow_marshaller = derive_arrow_marshaller(cls)
+        return cls.arrow_marshaller.from_arrow_array(arrow)
+
+    @classmethod
+    def from_parquet(cls, f: str) -> Iterator[T]:
+        if cls.arrow_marshaller is None:
+            cls.arrow_marshaller = derive_arrow_marshaller(cls)
+        return read_parquet(f, cls)
+
+    def to_arrow(self) -> pa.StructScalar:
+        cls = type(self)
+        if cls.arrow_marshaller is None:
+            cls.arrow_marshaller = derive_arrow_marshaller(cls)
+        return type(self).arrow_marshaller.to_arrow(self)
+
+    def to_arrow_array(self) -> pa.StructArray:
+        cls = type(self)
+        if cls.arrow_marshaller is None:
+            cls.arrow_marshaller = derive_arrow_marshaller(cls)
+        return type(self).arrow_marshaller.to_arrow_array([self])
